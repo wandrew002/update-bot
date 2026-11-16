@@ -6,7 +6,7 @@ Verified on wandrew002's Windows 11 PC with Windows PowerShell 5.1 on November 1
 
 - `Update-AllApps.ps1`: discovers winget updates, runs independent installers concurrently (MSI installers share a serial lane), and retries installer-lock conflicts. Steam, NVIDIA, Defender/Windows Update, and VS Code extensions run alongside. Also checks Store apps, npm globals, Python packages, vendor updaters, every installed Ollama model, and the G HUB background updater service when present. G HUB controls its own update timing; running its service does not prove an immediate check or installation. Windows updates require the IDs recorded in `UpdateBot/approved-windows-updates.json`; it never automatically reboots.
 - `cursor-update-fix.ps1`: watches Cursor's update logs, closes windowless leftovers blocking an explicitly requested update, and reopens Cursor when the updater fails to do so. A normal quit stays closed.
-- `mascot.json` (1,307,829 bytes) and `mascot.sixel.json` (3,887,245 bytes): included because this repository has no file-size restriction prohibiting them. The Sixel image displays in compatible Windows Terminal; other terminals use text. Run startup moves a classic console into Terminal unless Terminal itself needs updating.
+- `mascot.json` (1,307,829 bytes) and `mascot.sixel.json` (3,887,245 bytes): the mascot frames, bundled so the bot works without Python. The Sixel image displays in compatible Windows Terminal; other terminals use text. Run startup moves a classic console into Terminal unless Terminal itself needs updating.
 
 Logs, attention lists, version memos, local launchers, and installed-app inventories stay outside Git. There is no scheduled Claude routine. The main script can launch a local Claude handoff when items remain; `-NoClaude` disables that behavior. Steam updates are limited to Steam itself and Wallpaper Engine (appid 431960); other Steam titles are set to update when launched, with their previous settings recorded locally.
 
@@ -108,3 +108,7 @@ At the end of a completed real run, package/version installer folders under `%TE
 On this PC, WSL reports not installed, so no WSL update or distro installation was added. GIGABYTE's `GCC` task runs `GCC.exe -b`, a background application launcher; no verified quiet updater command was found, so it is not started by this addition. G HUB's existing `LGHUBUpdaterService` is checked and started only if stopped, without service restart or configuration changes. The requested Ollama `qwen3.5:4b-q8_0` pull completed successfully.
 
 Vendor references: [Logitech background updater service guidance](https://support.logi.com/hc/en-au/articles/35644288645655-G-HUB-Service-restart-guide) and [GIGABYTE Update Center overview](https://www.gigabyte.com/Consumer/Software/GIGABYTE-Control-Center/). Neither establishes a supported headless forced-check command.
+
+## Where this came from
+
+This repository was split out of `projects/update-bot` in the private `wandrew002/agent-knowledge` notes repository on November 16, 2026. The running copy on the PC is in `C:\Users\yeet\Scripts`; this repository is the published source, so copy changes here after they are tested and promoted there.
