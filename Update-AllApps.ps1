@@ -81,6 +81,7 @@
 
 [CmdletBinding()]
 param(
+    [switch]$SelfTest,
     [switch]$DryRun,
     [switch]$IncludeStore,
     [switch]$SkipDevTools,
@@ -99,6 +100,31 @@ param(
     [string]$ChildStep,
     [string]$ChildOut
 )
+
+if ($SelfTest) {
+    $tokens = $null; $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { $parseErrors | Write-Output; exit 1 }
+    $testRoot = Join-Path $PSScriptRoot 'tests'
+    if (-not (Test-Path -LiteralPath $testRoot)) { $testRoot = Join-Path $PSScriptRoot '_work\tests' }
+    $tests = @(Get-ChildItem -LiteralPath $testRoot -Filter 'Test-*.ps1' -File -ErrorAction Stop | Sort-Object Name)
+    if ($tests.Count -eq 0) { throw 'No test scripts found; self-test cannot pass.' }
+    $watcher = Join-Path $PSScriptRoot 'cursor-update-fix.ps1'
+    if (-not (Test-Path -LiteralPath $watcher)) { $watcher = Join-Path (Split-Path $PSScriptRoot) 'cursor-update-fix.ps1' }
+    foreach ($test in $tests) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($test.FullName, [ref]$tokens, [ref]$parseErrors)
+        if ($parseErrors.Count) { $parseErrors | Write-Output; exit 1 }
+        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $test.FullName)
+        $parameters = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        if ($parameters -contains 'Script') { $arguments += @('-Script', $PSCommandPath) }
+        if ($parameters -contains 'Watcher') { $arguments += @('-Watcher', $watcher) }
+        Write-Output ('Testing {0}' -f $test.Name)
+        & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @arguments
+        if ($LASTEXITCODE -ne 0) { Write-Output ('FAILED: {0} (exit {1})' -f $test.Name, $LASTEXITCODE); exit 1 }
+    }
+    Write-Output ('SELF-TEST PASSED ({0} suites plus parse checks)' -f $tests.Count)
+    exit 0
+}
 
 # --- Apps to never auto-update. Match on winget Id. Add as needed. ---
 $Exclude = @(
@@ -1699,9 +1725,76 @@ function Update-SteamQuietly {
     }
 }
 
+function Get-SelfUpdaterSteps {
+    'Start-VendorUpdaters', 'Test-DiscordUpdate', 'Update-NvidiaDriver', 'Update-SteamQuietly'
+    if (Get-Command ollama.exe -ErrorAction Ignore) { 'Update-OllamaModels' }
+    if (Get-Service -Name LGHUBUpdaterService -ErrorAction Ignore) { 'Update-GHubService' }
+}
+
+function Update-OllamaModels {
+    Set-Phase 'Updating installed Ollama models'
+    $key = 'ollama-models'
+    [void](Add-Item -Key $key -Label 'Ollama models' -State 'running')
+    $exe = (Get-Command ollama.exe -ErrorAction Stop).Source
+    $list = Invoke-Animated -File $exe -Arguments @('list') -TimeoutSec 60
+    if ($list.ExitCode -ne 0 -or $list.TimedOut) {
+        Set-Item -Key $key -State 'failed' -Note 'could not list models'
+        Write-Log ('Ollama model list failed: {0}' -f (Format-NativeOutput $list.Output)) 'WARN'
+        Add-Handoff -Source 'Ollama' -Name 'Installed models' -Reason 'ollama list failed' -Suggestion 'Check the local Ollama server and rerun.'
+        return
+    }
+    $models = @($list.StdOut -split "`r?`n" | Select-Object -Skip 1 | ForEach-Object {
+        $name = ($_ -split '\s+')[0]
+        if ($name -match '^[A-Za-z0-9][A-Za-z0-9._/:-]*$') { $name }
+    } | Select-Object -Unique)
+    if ($models.Count -eq 0) {
+        Set-Item -Key $key -State 'skip' -Note 'no installed models'
+        Write-Log 'Ollama: no installed models to pull.'
+        return
+    }
+    $bad = 0
+    foreach ($model in $models) {
+        if ($DryRun) { Write-Log ('Would pull Ollama model {0}.' -f $model); continue }
+        Write-Log ('Ollama: pulling {0}.' -f $model)
+        $run = Invoke-Animated -File $exe -Arguments @('pull', $model) -TimeoutSec 3600
+        if ($run.ExitCode -ne 0 -or $run.TimedOut) {
+            $bad++
+            Write-Log ('Ollama pull {0} failed (exit {1}, timeout {2}): {3}' -f $model, $run.ExitCode, $run.TimedOut, (Format-NativeOutput $run.Output)) 'WARN'
+            Add-Handoff -Source 'Ollama' -Name $model -Reason 'model pull failed or timed out' -Suggestion ('Run ollama pull {0} and check server/network access.' -f $model)
+        } else { Write-Log ('Ollama: {0} pull completed.' -f $model) 'OK' }
+    }
+    if ($DryRun) { Set-Item -Key $key -State 'skip' -Note 'dry run' }
+    elseif ($bad) { Set-Item -Key $key -State 'failed' -Note ("$bad pull(s) failed") }
+    else { Set-Item -Key $key -State 'done' -Note ('{0} model(s) checked' -f $models.Count) }
+}
+
+function Update-GHubService {
+    Set-Phase 'Checking G HUB background updater'
+    $key = 'ghub-updater'
+    [void](Add-Item -Key $key -Label 'Logitech G HUB updater' -State 'running')
+    try {
+        $service = Get-Service -Name LGHUBUpdaterService -ErrorAction Stop
+        if ($service.Status -ne 'Running') {
+            if ($DryRun) {
+                Write-Log 'Would start the G HUB updater service.'
+                Set-Item -Key $key -State 'skip' -Note 'dry run'
+                return
+            }
+            Start-Service -Name LGHUBUpdaterService -ErrorAction Stop
+            $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+        }
+        Write-Log 'G HUB updater service is running; it controls its own update timing. No forced check or completed update is claimed.' 'OK'
+        Set-Item -Key $key -State 'done' -Note 'background updater running'
+    } catch {
+        Write-Log ('G HUB updater service: {0}' -f $_.Exception.Message) 'WARN'
+        Set-Item -Key $key -State 'failed' -Note 'service not running'
+        Add-Handoff -Source 'G HUB' -Name 'Updater service' -Reason $_.Exception.Message -Suggestion 'Check LGHUBUpdaterService in Services.'
+    }
+}
+
 function Invoke-SelfUpdaters {
     param([string[]]$Skip = @())      # steps already running alongside as their own process
-    foreach ($step in 'Start-VendorUpdaters', 'Test-DiscordUpdate', 'Update-NvidiaDriver', 'Update-SteamQuietly') {
+    foreach ($step in @(Get-SelfUpdaterSteps)) {
         if ($Skip -contains $step) { continue }
         try { & $step }
         catch { Write-Log ('{0} stopped at line {1}: {2}' -f $step, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message) 'WARN' }
@@ -2143,11 +2236,50 @@ function Update-WindowsParts {
 }
 
 # ===========================================================================
+function Remove-OldWingetInstallers {
+    param([string]$Root = (Join-Path $env:TEMP 'WinGet'), [datetime]$Now = (Get-Date))
+    if ($DryRun -or -not (Test-Path -LiteralPath $Root -PathType Container)) { return }
+    $base = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    if ($base.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Write-Log 'Installer cleanup skipped: root is a link.' 'WARN'
+        return
+    }
+    $prefix = $base.FullName.TrimEnd('\') + '\'
+    $cutoff = $Now.AddDays(-14)
+    $removed = 0; $bytes = 0L
+    foreach ($folder in @(Get-ChildItem -LiteralPath $base.FullName -Directory -Force)) {
+        # Retain shared caches, links and recently used folders.
+        if ($folder.Name -notmatch '^.+\.\d' -or $folder.Name -match '(?i)riot|leagueoflegends|teamfight') { continue }
+        $target = [IO.Path]::GetFullPath($folder.FullName)
+        if (-not $target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+            (Split-Path -Parent $target) -ne $base.FullName -or
+            ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $folder.LastWriteTime -ge $cutoff) { continue }
+        try {
+            $children = @(Get-ChildItem -LiteralPath $target -Recurse -Force -ErrorAction Stop)
+            if (@($children | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $_.LastWriteTime -ge $cutoff }).Count) { continue }
+            $size = ($children | Where-Object { -not $_.PSIsContainer } | Measure-Object Length -Sum).Sum
+            Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+            $removed++; $bytes += [long]$size
+            Write-Log ('Removed old installer folder: {0}' -f $folder.Name)
+        } catch { Write-Log ('Installer cleanup skipped {0}: {1}' -f $folder.Name, $_.Exception.Message) 'WARN' }
+    }
+    Write-Log ('Installer cleanup: {0} folder(s), {1} reclaimed; retained the last 14 days and shared caches.' -f $removed, (Format-Bytes $bytes))
+}
+
+function Invoke-RetentionCleanup {
+    if ($DryRun) { return }
+    Remove-OldWingetInstallers
+    $old = @(Get-ChildItem -LiteralPath $LogDir -Filter '*.log' -File -Recurse | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-90) })
+    Write-Log ('Log retention: {0} log(s) older than 90 days; preserved pending user decision.' -f $old.Count)
+    foreach ($log in $old) { Write-Log ('Old log retained: {0} ({1}, {2} bytes)' -f $log.FullName, $log.LastWriteTime.ToString('yyyy-MM-dd'), $log.Length) }
+}
+
 function Invoke-Update {
     if ($SelfUpdatersOnly) {
         Write-Log ('Checking only the apps that update themselves | elevated: {0}' -f $isAdmin)
-        $script:UI.Total = 4
+        $script:UI.Total = @(Get-SelfUpdaterSteps).Count
         Invoke-SelfUpdaters
+        Invoke-RetentionCleanup
         Set-Phase ('Done {0}' -f $Glyph.Party)
         Write-Log 'Done (apps that update themselves only).' 'OK'
         Write-Log "Log: $LogFile"
@@ -2256,7 +2388,7 @@ function Invoke-Update {
     if ($hasNpm)       { $extraSteps++ }
     if ($hasPython)    { $extraSteps++ }
     if ($hasCode)      { $extraSteps++ }
-    if (-not $SkipSelfUpdaters) { $extraSteps += 4 }  # app updater tasks, Discord, NVIDIA driver, Steam
+    if (-not $SkipSelfUpdaters) { $extraSteps += @(Get-SelfUpdaterSteps).Count }  # discovered self-updater steps
     if ($Adopt.Count -gt 0)     { $extraSteps++ }
     $script:UI.Total = $targets.Count + $extraSteps
 
@@ -2456,6 +2588,8 @@ function Invoke-Update {
     }
     Write-Handoff
 
+    Invoke-RetentionCleanup
+    Write-Log ('Progress: {0}/{1} steps completed.' -f $script:UI.Done, $script:UI.Total)
     $script:UI.Done = $script:UI.Total
     Set-Phase ('All done {0}  {1} updated, {2} failed, {3} need attention' -f $Glyph.Party, $ok, $fail, $script:Handoff.Count)
     Write-Log ('Done. {0} updated, {1} failed, {2} excluded.{3}' -f $ok, $fail, $skipped.Count, $storeMsg) 'OK'
